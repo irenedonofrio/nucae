@@ -31,7 +31,8 @@ import torch
 from scipy.stats import wilcoxon
 
 from nucae.MaxFinder import get_peaks
-from nucae.metrics import nearest_peak_distances, pearson
+from nucae.metrics import nearest_peak_distances, peak_distances_both_ways, pearson
+from nucae.data import WindowDataset
 from nucae.module import NucAEModule
 from nucae.prewindowed import CfDNAWindows
 
@@ -45,6 +46,12 @@ ap.add_argument("--out", type=Path, required=True)
 ap.add_argument("--dual-stream", action="store_true",
                 help="required for a V3 checkpoint: its module saved no such hparam")
 ap.add_argument("--limit", type=int, default=None, help="first N windows, for a smoke test")
+ap.add_argument("--format", choices=("prewindowed", "counts"), default="prewindowed",
+                help="`counts` reads a file from scripts/01_build_hdf5.py. A checkpoint "
+                     "trained on one format must be evaluated on that format: the two "
+                     "tile windows differently and the numbers do not correspond.")
+ap.add_argument("--input-level", default=None, help="--format counts: input level")
+ap.add_argument("--target-level", default=None, help="--format counts: target level")
 a = ap.parse_args()
 
 a.out.mkdir(parents=True, exist_ok=True)
@@ -60,7 +67,15 @@ model = model.to(device)
 
 # use_sequence comes from the checkpoint, never from a flag: a no-sequence
 # checkpoint fed six channels would fail, and the reverse would train-test skew.
-dataset = CfDNAWindows(a.data, "test", use_sequence=model.hparams.use_sequence)
+if a.format == "counts":
+    if not (a.input_level and a.target_level):
+        ap.error("--format counts requires --input-level and --target-level")
+    if not model.hparams.use_sequence:
+        ap.error("this checkpoint has use_sequence=False; WindowDataset always "
+                 "supplies the sequence channels")
+    dataset = WindowDataset(a.data, a.input_level, a.target_level, split="test")
+else:
+    dataset = CfDNAWindows(a.data, "test", use_sequence=model.hparams.use_sequence)
 n_windows = len(dataset) if a.limit is None else min(a.limit, len(dataset))
 print(f"{a.ckpt.name}: {n_windows} test windows, use_sequence={model.hparams.use_sequence}")
 
@@ -74,7 +89,13 @@ def append_bedgraph(path: Path, chrom: str, start: int, signal: np.ndarray) -> N
 
 signal_rows, peak_rows = [], []
 for i in range(n_windows):
-    x, y = dataset[i]
+    item = dataset[i]
+    x, y = item[0], item[1]
+    # Recorded, never applied. Metrics stay computed over every position so a
+    # counts-format number is built the same way as a pre-windowed one; the
+    # clean-vs-unmappable split is then an analysis of this column, not a
+    # different definition of the metric. NaN where the format has no mask.
+    valid_frac = float(item[2].mean()) if len(item) == 3 else float("nan")
     with torch.no_grad():
         prediction = model(x.unsqueeze(0).to(device))
 
@@ -91,6 +112,7 @@ for i in range(n_windows):
         "mse_recon": float(np.mean((reconstructed - original) ** 2)),
         "pearson_recon": pearson(reconstructed, original),
         "pearson_under": pearson(undersampled, original),
+        "valid_frac": valid_frac,
     })
 
     peaks = {name: get_peaks(signal, *PEAK_PARAMS)[0] for name, signal in
@@ -100,6 +122,10 @@ for i in range(n_windows):
 
     distances = {name: np.median(nearest_peak_distances(peaks[name], peaks["orig"]))
                  for name in ("recon", "under")}
+    # Reverse direction: one distance per CALLED peak, so a signal that calls
+    # extra peaks is charged for them. `distances` above cannot see that.
+    reverse = {name: np.median(peak_distances_both_ways(peaks[name], peaks["orig"])[1])
+               for name in ("recon", "under")}
     peak_rows.append({
         "window_idx": i, "chrom": meta["chrom"], "start": meta["start"],
         # Peak COUNTS are not decoration: nearest_peak_distances is one-directional,
@@ -108,6 +134,8 @@ for i in range(n_windows):
         "n_peaks_under": len(peaks["under"]),
         "median_dist_recon": float(distances["recon"]),
         "median_dist_under": float(distances["under"]),
+        "median_dist_recon_rev": float(reverse["recon"]),
+        "median_dist_under_rev": float(reverse["under"]),
         "improvement_bp": float(distances["under"] - distances["recon"]),
         "beats_input": bool(distances["recon"] < distances["under"]),
     })
@@ -147,9 +175,17 @@ summary = "\n".join([
     f"  median dist input (bp)    : {df_peaks['median_dist_under'].median():.2f}",
     f"  mean improvement (bp)     : {df_peaks['improvement_bp'].mean():.2f}",
     f"  windows recon beats input : {df_peaks['beats_input'].mean() * 100:.1f}%",
-    f"  peaks called orig/recon   : {df_peaks['n_peaks_orig'].median():.0f} / "
-    f"{df_peaks['n_peaks_recon'].median():.0f}  (median; the distance above is",
-    "                              one-directional, so extra peaks are free)",
+    "",
+    "   reverse direction: one distance per CALLED peak, which charges a",
+    "   signal for peaks it invents. The forward numbers above do not.",
+    f"  median dist recon rev (bp): {df_peaks['median_dist_recon_rev'].median():.2f}",
+    f"  median dist input rev (bp): {df_peaks['median_dist_under_rev'].median():.2f}",
+    "",
+    f"  peaks called (median)     : orig {df_peaks['n_peaks_orig'].median():.0f}"
+    f" / recon {df_peaks['n_peaks_recon'].median():.0f}"
+    f" / input {df_peaks['n_peaks_under'].median():.0f}",
+    "   Quote the forward improvement ONLY if the reverse direction agrees:",
+    "   whichever signal calls more peaks wins the forward comparison for free.",
     "",
     "-- Wilcoxon signed-rank ------------------------------",
     "  H0: no difference in peak distance",

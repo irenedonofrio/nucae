@@ -20,11 +20,27 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import CSVLogger
 
 from nucae.module import LR_PATIENCE, NucAEModule
+from nucae.data import WindowDataModule
 from nucae.prewindowed import CfDNAWindowsDataModule
 
 ap = argparse.ArgumentParser(description=__doc__,
                              formatter_class=argparse.RawDescriptionHelpFormatter)
-ap.add_argument("--data", type=Path, required=True, help="pre-windowed cfdna_*.h5")
+ap.add_argument("--data", type=Path, required=True,
+                help="pre-windowed cfdna_*.h5, or a counts-derived .h5 with --format counts")
+ap.add_argument("--format", choices=("prewindowed", "counts"), default="prewindowed",
+                help="`prewindowed`: the inherited cfdna_*.h5 the cluster trained on. "
+                     "`counts`: built by scripts/01_build_hdf5.py. NOT INTERCHANGEABLE "
+                     "-- the two tile windows differently, so a checkpoint from one "
+                     "cannot be evaluated against the other's numbers. Explicit rather "
+                     "than sniffed: guessing the format would make that silent.")
+ap.add_argument("--input-level", default=None,
+                help="--format counts: level used as model INPUT, e.g. `under`")
+ap.add_argument("--target-level", default=None,
+                help="--format counts: level used as TARGET, e.g. `full`")
+ap.add_argument("--masked-loss", action="store_true",
+                help="--format counts: weight the loss by the validity mask. OFF by "
+                     "default so a first counts run changes the data and nothing else; "
+                     "the objective is a separate experiment with its own number.")
 ap.add_argument("--out", type=Path, required=True, help="run directory; created")
 ap.add_argument("--no-sequence", action="store_true", help="V2 ablation: coverage only")
 ap.add_argument("--dual-stream", action="store_true", help="V3: one stream per modality")
@@ -54,11 +70,31 @@ a.out.mkdir(parents=True, exist_ok=True)
     json.dumps({**{k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()},
                 "torch": torch.__version__, "lightning": pl.__version__}, indent=2))
 
-data = CfDNAWindowsDataModule(a.data, batch_size=a.batch_size, num_workers=a.workers,
-                              use_sequence=not a.no_sequence)
+if a.format == "counts":
+    if not (a.input_level and a.target_level):
+        ap.error("--format counts requires --input-level and --target-level")
+    if a.no_sequence:
+        # WindowDataset always one-hots the reference; a coverage-only variant
+        # would need a different reader, not a flag.
+        ap.error("--no-sequence is not available for --format counts")
+    data = WindowDataModule(a.data, input_level=a.input_level,
+                            target_level=a.target_level, batch_size=a.batch_size,
+                            num_workers=a.workers)
+else:
+    for flag, value in (("--input-level", a.input_level),
+                        ("--target-level", a.target_level)):
+        if value is not None:
+            ap.error(f"{flag} applies only to --format counts")
+    if a.masked_loss:
+        ap.error("--masked-loss applies only to --format counts: the pre-windowed "
+                 "files carry no mask")
+    data = CfDNAWindowsDataModule(a.data, batch_size=a.batch_size,
+                                  num_workers=a.workers,
+                                  use_sequence=not a.no_sequence)
+
 model = NucAEModule(lr=a.lr, weight_decay=a.weight_decay,
                     use_sequence=not a.no_sequence, dual_stream=a.dual_stream,
-                    lr_patience=a.lr_patience)
+                    lr_patience=a.lr_patience, masked_loss=a.masked_loss)
 
 trainer = pl.Trainer(
     max_epochs=a.epochs,

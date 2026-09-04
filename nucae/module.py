@@ -44,7 +44,8 @@ class NucAEModule(pl.LightningModule):
 
     def __init__(self, lr: float = 1e-3, weight_decay: float = 1e-2,
                  use_sequence: bool = True, dual_stream: bool = False,
-                 lr_patience: int = LR_PATIENCE) -> None:
+                 lr_patience: int = LR_PATIENCE,
+                 masked_loss: bool = False) -> None:
         super().__init__()
         self.save_hyperparameters()
         self.model = FragmentomicsUNet(use_sequence=use_sequence,
@@ -53,16 +54,48 @@ class NucAEModule(pl.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
+    @staticmethod
+    def _unpack(batch):
+        """(x, y) from the pre-windowed format, (x, y, valid) from the counts one.
+
+        The third element is a LOSS WEIGHT, and only nucae.data.WindowDataset
+        can supply it: the pre-windowed files carry no mask at all. Returning
+        None rather than a tensor of ones keeps that distinction visible -- "no
+        mask exists" and "every position is valid" are different claims, and
+        the second one is not something this repository can make about the
+        inherited files.
+        """
+        return batch if len(batch) == 3 else (batch[0], batch[1], None)
+
+    def _loss(self, y_hat: torch.Tensor, y: torch.Tensor,
+              valid: torch.Tensor | None) -> torch.Tensor:
+        """MSE, weighted by validity only when BOTH a mask exists and it is asked for.
+
+        `masked_loss` defaults False so that a run on counts-derived data
+        changes the DATA and nothing else. Turning it on is a change to the
+        objective and therefore a separate experiment with its own number --
+        moving both at once would leave neither attributable.
+
+        Weighted, the denominator is the count of valid positions, not the
+        window length: dividing by the length would shrink the loss of a
+        heavily masked window toward zero and quietly teach the model that
+        unmappable regions are already solved.
+        """
+        if not self.hparams.masked_loss or valid is None:
+            return F.mse_loss(y_hat, y)
+        weight = valid.unsqueeze(1)                     # (B, L) -> (B, 1, L)
+        return (((y_hat - y) ** 2) * weight).sum() / weight.sum().clamp(min=1.0)
+
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
-        x, y = batch
-        loss = F.mse_loss(self(x), y)
+        x, y, valid = self._unpack(batch)
+        loss = self._loss(self(x), y, valid)
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx: int) -> torch.Tensor:
-        x, y = batch
+        x, y, valid = self._unpack(batch)
         y_hat = self(x)
-        loss = F.mse_loss(y_hat, y)
+        loss = self._loss(y_hat, y, valid)
         self.log("val_loss", loss, prog_bar=True)
         # Measured, not optimised. Reported so the shape/amplitude split is
         # visible: MSE can fall while r stalls, and that is worth seeing early.

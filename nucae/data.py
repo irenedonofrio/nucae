@@ -27,7 +27,8 @@ import numpy as np
 import pysam
 import torch
 from scipy.ndimage import binary_dilation
-from torch.utils.data import Dataset
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader, Dataset
 
 from . import preprocess
 
@@ -232,8 +233,22 @@ def build_chromosome(h5: h5py.File, sample_id: str, level: str, chrom: str,
     sequence = load_sequence(fasta, chrom, n)
 
     shared = h5.require_group(f"shared/{chrom}")
-    shared.create_dataset("mask", data=mask, dtype="?", chunks=(window,))
-    shared.create_dataset("sequence", data=sequence, dtype="u1", chunks=(window,))
+    for name, values, dtype in (("mask", mask, "?"), ("sequence", sequence, "u1")):
+        if name in shared:
+            # shared/ depends on the chromosome and the reference genome, never on
+            # the level, so the second level built for a chromosome must find what
+            # the first one wrote. VERIFIED, not assumed: a different --mappable or
+            # --fasta between two levels of one sample would otherwise leave a mask
+            # that does not describe the counts stored beside it, and every window
+            # validity in the file would be quietly wrong.
+            if not np.array_equal(shared[name][:], values):
+                raise ValueError(
+                    f"{sample_id}/{chrom}: shared/{name} already in the file differs "
+                    f"from what level {level!r} would write. All levels in one file "
+                    f"must be built against the same reference genome and the same "
+                    f"mappability BED.")
+            continue
+        shared.create_dataset(name, data=values, dtype=dtype, chunks=(window,))
 
     level_group = h5.require_group(f"levels/{level}")
     level_group.attrs.update(level_attrs)
@@ -286,7 +301,19 @@ class WindowDataset(Dataset):
                 if f"levels/{level}" not in h5:
                     raise KeyError(f"{self.path.name}: no level {level!r}")
             index = h5["index"]
-            select = np.ones(index["start"].shape[0], dtype=bool)
+            # ONE ROW PER WINDOW, not one per level. build_chromosome appends an
+            # index row for every (level, chromosome) it writes, so a two-level
+            # file holds each window twice with identical coordinates. Without
+            # this filter every window is served once per level: the epoch is a
+            # multiple of its true size and so is the reported test-set count.
+            # target_level is the arbitrary but fixed choice; the row supplies
+            # coordinates only, and both levels' rows carry the same ones.
+            select = index["level"][:] == target_level.encode()
+            if not select.any():
+                raise ValueError(
+                    f"{self.path.name}: /index has no rows for level "
+                    f"{target_level!r}; levels present: "
+                    f"{sorted({v.decode() for v in np.unique(index['level'][:])})}")
             if split is not None:
                 select &= index["split"][:] == split.encode()
             if keep_only:
@@ -361,3 +388,73 @@ class WindowDataset(Dataset):
         return (torch.from_numpy(model_input),
                 torch.from_numpy(target[None, :].astype(np.float32)),
                 torch.from_numpy(valid.astype(np.float32)))
+
+    def metadata(self, i: int) -> dict[str, object]:
+        """Coordinates for window i, for writing predictions back to bedGraph.
+
+        Same keys as CfDNAWindows.metadata so scripts/04 can write either format
+        through one path. Unlike that one, `chrom` here is read from the same
+        /index row as start and end, so the two cannot disagree.
+        """
+        row = int(self.rows[i])
+        index = self.h5["index"]
+        return {"chrom": index["chrom"][row].decode(),
+                "start": int(index["start"][row]),
+                "end": int(index["end"][row]),
+                "split": index["split"][row].decode()}
+
+
+class WindowDataModule(pl.LightningDataModule):
+    """Train/val/test loaders over one counts-derived HDF5.
+
+    The counterpart of prewindowed.CfDNAWindowsDataModule, and deliberately the
+    same shape, so scripts/03 can hold one code path per stage rather than one
+    per format. Two differences are inherent, not stylistic:
+
+      - the split comes from the /index `split` COLUMN, not from the group name,
+        so moving a chromosome between splits is a column write and not a
+        rebuild. SPLITS in this module is what stamped it.
+      - a batch is a 3-tuple; the third element is the validity weight. Whether
+        the loss uses it is the module's decision (`masked_loss`), never the
+        dataloader's -- a loader that silently dropped it would make the two
+        formats look interchangeable when they are not.
+    """
+
+    def __init__(self, path: Path, input_level: str, target_level: str,
+                 batch_size: int = 16, num_workers: int = 4,
+                 pin_memory: bool = True, keep_only: bool = True) -> None:
+        super().__init__()
+        self.path = Path(path)
+        self.input_level = input_level
+        self.target_level = target_level
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory
+        self.keep_only = keep_only
+        self.datasets: dict[str, WindowDataset] = {}
+
+    def setup(self, stage: str | None = None) -> None:
+        # No window is fetched here: touching one opens an HDF5 handle in the
+        # parent that every forked worker would then inherit. Same hazard and
+        # same reason as CfDNAWindowsDataModule.
+        wanted = {"fit": ("train", "val"), "validate": ("val",),
+                  "test": ("test",)}.get(stage, ("train", "val", "test"))
+        for split in wanted:
+            self.datasets[split] = WindowDataset(
+                self.path, self.input_level, self.target_level,
+                split=split, keep_only=self.keep_only)
+
+    def _loader(self, split: str, shuffle: bool, drop_last: bool) -> DataLoader:
+        return DataLoader(self.datasets[split], batch_size=self.batch_size,
+                          shuffle=shuffle, drop_last=drop_last,
+                          num_workers=self.num_workers, pin_memory=self.pin_memory,
+                          persistent_workers=self.num_workers > 0)
+
+    def train_dataloader(self) -> DataLoader:
+        return self._loader("train", shuffle=True, drop_last=True)
+
+    def val_dataloader(self) -> DataLoader:
+        return self._loader("val", shuffle=False, drop_last=False)
+
+    def test_dataloader(self) -> DataLoader:
+        return self._loader("test", shuffle=False, drop_last=False)

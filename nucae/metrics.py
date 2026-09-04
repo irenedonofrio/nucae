@@ -101,3 +101,31 @@ def nearest_peak_distances(query_peaks, ref_peaks) -> np.ndarray | None:
         return None
     query = np.asarray(query_peaks)
     return np.array([np.min(np.abs(query - p)) for p in np.asarray(ref_peaks)])
+
+
+def peak_distances_both_ways(query_peaks, ref_peaks
+                             ) -> tuple[np.ndarray, np.ndarray] | None:
+    """Nearest-peak distance measured in BOTH directions. Closes the blind spot above.
+
+    Returns `(recall, precision)`:
+
+      recall     one distance per REFERENCE peak -- did the query find the peaks
+                 that are really there? This is `nearest_peak_distances` exactly,
+                 the one-directional number reported historically.
+      precision  one distance per QUERY peak -- are the peaks the query called
+                 actually there? Nothing in `recall` asks this, which is why a
+                 signal with a peak every base scores a perfect recall of zero.
+
+    Report both, or report the max. On the fullgenome test split the raw input
+    calls a median of 100 peaks against 114 true and the reconstruction calls
+    120, so recall alone flatters whichever signal calls more -- the direction
+    the historical 22 bp vs 39 bp comparison is biased in.
+
+    Returns None when either side has no peaks, matching the convention above:
+    "not measurable here", never a distance of zero.
+    """
+    recall = nearest_peak_distances(query_peaks, ref_peaks)
+    precision = nearest_peak_distances(ref_peaks, query_peaks)
+    if recall is None or precision is None:
+        return None
+    return recall, precision

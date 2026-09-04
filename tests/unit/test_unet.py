@@ -6,8 +6,10 @@ clean rewrite rather than a new model: for each variant it asserts that the
 state_dict keys and shapes are identical, that the old weights load with
 strict=True, and that both networks then return bit-identical output.
 
-Skipped, not failed, when old_nucae/ is absent -- the reference is a sibling
-repository that may not be checked out.
+FAILS, not skips, when old_nucae/ is absent. A skip here would leave a green
+suite that verified nothing, on the one test the README calls the reason this
+rewrite may be trusted. Absent reference means unverified port, and unverified
+must not look like passed.
 """
 
 from __future__ import annotations
@@ -44,7 +46,15 @@ def reference_net(module_name: str, kwargs: dict) -> torch.nn.Module:
     """
     path = OLD / f"{module_name}.py"
     if not path.exists():
-        pytest.skip(f"reference implementation not present: {path}")
+        pytest.fail(
+            f"reference implementation not found: {path}\n"
+            "\n"
+            "This test is what proves nucae/unet.py reproduces the networks that\n"
+            "produced every existing checkpoint. Without the reference, nothing\n"
+            "in this suite verifies the port.\n"
+            "\n"
+            "Check out old_nucae/ as a sibling of this repository and re-run."
+        )
     spec = importlib.util.spec_from_file_location(f"_old_{module_name}", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
