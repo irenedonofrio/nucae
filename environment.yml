@@ -1,0 +1,26 @@
+# Authoritative record of the local environment (conda env `nucae`, macOS).
+# Versions are pinned to what is currently installed and verified working.
+# The cluster env is `ae_env` and is maintained separately.
+name: nucae
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - numpy=2.4.2
+  - pandas=2.3.3
+  - scipy=1.17.0
+  - h5py=3.16.0
+  - pysam=0.24.0
+  - matplotlib=3.10.8
+  - pytorch=2.5.1
+  - pytest=9.1.1
+  - pip
+  - pip:
+      # Whittaker-Eilers smoother used by the inherited preprocessing chain.
+      # Same package the production reference imports.
+      - whittaker-eilers==0.2.0
+      # Training loop. The existing cluster checkpoints were written by this
+      # package, so `import pytorch_lightning` is the namespace that loads
+      # them; the separately-named `lightning` package is not used here.
+      - pytorch-lightning==2.6.5

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nucae"
+version = "0.1.0"
+requires-python = ">=3.12"
+# Dependencies are declared in environment.yml, which is the single
+# authoritative record of the environment. They are deliberately not
+# duplicated here.
+
+[tool.setuptools.packages.find]
+include = ["nucae*"]

@@ -1,0 +1,15 @@
+results/
+*.h5
+*.npy
+*.npz
+*.tsv.gz
+# ...except the reference gate's fixture, which must survive a fresh clone.
+!tests/reference/*.tsv.gz
+__pycache__/
+.DS_Store
+wandb/
+*.egg-info/
+.ipynb_checkpoints/
+
+CLAUDE.md
+plan.md
