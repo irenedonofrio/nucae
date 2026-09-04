@@ -18,6 +18,12 @@ ap.add_argument("--fasta", type=Path, required=True, help=".fai must sit beside 
 ap.add_argument("--mappable", type=Path, required=True)
 ap.add_argument("--out", type=Path, required=True, help="one file per sample, e.g. BH01.h5")
 ap.add_argument("--chrom", action="append", help="repeatable; default all autosomes")
+ap.add_argument("--skip-existing", action="store_true",
+                help="skip any (level, chromosome) already in the file. FOR RESUMING AN "
+                     "INTERRUPTED BUILD ONLY. Off by default, because silently keeping "
+                     "what is on disk is wrong the moment an input changed: rebuilding "
+                     "with a different --mappable or --fasta would leave the old arrays "
+                     "in place and report success. Delete the file to rebuild.")
 ap.add_argument("--nominal-depth", type=float, default=float("nan"))
 ap.add_argument("--measured-depth", type=float, default=float("nan"))
 ap.add_argument("--n-fragments", type=int, default=-1)
@@ -39,6 +45,9 @@ a.out.parent.mkdir(parents=True, exist_ok=True)
 h5 = data.open_h5(a.out, reference_genome=a.fasta.name, sample_attrs=sample_attrs)
 print(f"{a.sample}/{a.level} -> {a.out}")
 for chrom in (a.chrom or data.AUTOSOMES):
+    if a.skip_existing and f"levels/{a.level}/{chrom}" in h5:
+        print(f"  {chrom}: already present, skipped")
+        continue
     data.build_chromosome(h5, a.sample, a.level, chrom,
                           a.counts_dir / f"{chrom}_counts.tsv.gz",
                           a.fasta, a.mappable, level_attrs)

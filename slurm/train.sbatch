@@ -56,6 +56,16 @@ shift 2
 source ~/.bashrc
 conda activate ae_env      # NEVER base; `nucae` is the MacBook name
 
+# ONE THREAD PER WORKER. The counts-format dataloader smooths two windows per
+# item, and numpy/scipy would each take every core they can see: 8 workers x 8
+# threads on 8 CPUs is 64-way contention, and the workers spend their time
+# descheduling each other. The parallelism that matters here is ACROSS workers,
+# not inside one. Harmless for the pre-windowed format, which does no smoothing.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
 echo "job:   ${SLURM_JOB_ID}"
 echo "node:  $(hostname)"
 echo "gpu:   ${CUDA_VISIBLE_DEVICES:-none}"
