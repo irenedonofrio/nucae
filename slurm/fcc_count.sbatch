@@ -52,8 +52,14 @@ for f in "${FASTA}" "${FASTA}.fai" "${MAPPABLE}"; do
     [ -f "$f" ] || { echo "ERROR: not found: $f" >&2; exit 2; }
 done
 
+# `set -u` off just for the environment setup: /etc/profile.d scripts and conda's
+# own activate hooks reference unbound variables, and with -u active that kills
+# the job before any work starts. Restored immediately after -- the point of -u
+# is to catch OUR unset variables, not the system's.
+set +u
 source ~/.bashrc
 conda activate tfp_env     # 02_fcc_count.sh no longer activates conda itself
+set -u
 
 echo "job:     ${SLURM_JOB_ID}"
 echo "node:    $(hostname)"

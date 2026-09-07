@@ -53,8 +53,14 @@ HDF5="${1:?usage: sbatch slurm/train.sbatch <cfdna.h5> <out_dir> [extra args]}"
 OUT="${2:?missing output directory}"
 shift 2
 
+# `set -u` off just for the environment setup: /etc/profile.d scripts and conda's
+# own activate hooks reference unbound variables, and with -u active that kills
+# the job before any work starts. Restored immediately after -- the point of -u
+# is to catch OUR unset variables, not the system's.
+set +u
 source ~/.bashrc
 conda activate ae_env      # NEVER base; `nucae` is the MacBook name
+set -u
 
 # ONE THREAD PER WORKER. The counts-format dataloader smooths two windows per
 # item, and numpy/scipy would each take every core they can see: 8 workers x 8

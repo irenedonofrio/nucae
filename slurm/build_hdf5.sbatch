@@ -72,8 +72,14 @@ for chrom in chr{1..22}; do
     done
 done
 
+# `set -u` off just for the environment setup: /etc/profile.d scripts and conda's
+# own activate hooks reference unbound variables, and with -u active that kills
+# the job before any work starts. Restored immediately after -- the point of -u
+# is to catch OUR unset variables, not the system's.
+set +u
 source ~/.bashrc
 conda activate ae_env      # NEVER base; `nucae` is the MacBook name
+set -u
 
 echo "job:    ${SLURM_JOB_ID}"
 echo "node:   $(hostname)"

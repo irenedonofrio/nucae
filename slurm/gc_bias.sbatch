@@ -44,8 +44,14 @@ REPO="${1:?usage: sbatch slurm/gc_bias.sbatch <cfdna_tfp_profiling> <config.yaml
 CONFIG="${2:?missing gc config}"
 RESULTS="${3:?missing results root}"
 
+# `set -u` off just for the environment setup: /etc/profile.d scripts and conda's
+# own activate hooks reference unbound variables, and with -u active that kills
+# the job before any work starts. Restored immediately after -- the point of -u
+# is to catch OUR unset variables, not the system's.
+set +u
 source ~/.bashrc
 conda activate griffin     # run_gc_correction.sh activates NOTHING; that is the caller's job
+set -u
 
 echo "job:    ${SLURM_JOB_ID}"
 echo "node:   $(hostname)"

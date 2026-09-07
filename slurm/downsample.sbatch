@@ -44,8 +44,14 @@ case "$FRAC" in
          exit 2 ;;
 esac
 
+# `set -u` off just for the environment setup: /etc/profile.d scripts and conda's
+# own activate hooks reference unbound variables, and with -u active that kills
+# the job before any work starts. Restored immediately after -- the point of -u
+# is to catch OUR unset variables, not the system's.
+set +u
 source ~/.bashrc
 conda activate ae_env      # samtools; NEVER base
+set -u
 
 echo "job:   ${SLURM_JOB_ID}"
 echo "node:  $(hostname)"

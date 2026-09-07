@@ -1,0 +1,356 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage{parskip}
+
+\title{NucAE: reconstructing nucleosome coverage from sparse cfDNA sequencing}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{What the system does}
+
+Cell-free DNA fragments in blood are protected from degradation by nucleosomes,
+so the midpoint of a fragment marks approximately where a nucleosome sat. Counting
+those midpoints along the genome gives a coverage track whose peaks are nucleosome
+positions.
+
+At high sequencing depth this track is clean. At the depth a clinical assay can
+afford it is mostly noise. The model takes the noisy track and reconstructs what
+the deep one would have looked like.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+& \textbf{input} & \textbf{target} \\
+\midrule
+coverage & $\sim$5$\times$ & full depth \\
+window   & 25{,}000 bp & 25{,}000 bp \\
+extra    & reference sequence & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The reconstruction is judged against the deep track that was measured on the same
+sample, so the ground truth is real data and not a simulation.
+
+\section{Input}
+
+The pipeline begins from \textbf{fragment centre counts}, one file per chromosome:
+
+\begin{center}
+\texttt{chr8\quad 4103877\quad 3\quad 2.8714}
+\end{center}
+
+Four tab-separated columns: chromosome, 1-based position, raw count, GC-corrected
+count. Only covered positions are written; an absent position means zero coverage.
+The pipeline reads the GC-corrected column.
+
+These files are produced from BAMs by a separate project
+(\texttt{cfdna\_tfp\_profiling}). That boundary is deliberate: this repository
+starts from counts on disk and never reads a BAM.
+
+The undersampled arm is made by randomly subsampling the BAM by read name, so both
+ends of a fragment are kept or dropped together --- a half fragment has no midpoint.
+The seed and the fraction are recorded, since they are the only things that make
+that subsample reproducible.
+
+Two further inputs describe the genome rather than the sample: the reference
+sequence, and a \textbf{mappability list} of regions where short reads can be
+placed reliably.
+
+\section{Preprocessing}
+
+\subsection{The smoothing chain}
+
+Raw midpoint counts are spiky. Four steps in fixed order turn them into a
+nucleosome track:
+
+\begin{enumerate}
+\item \textbf{Blacklist zeroing.} Positions in unreliable regions are set to zero.
+\item \textbf{Whittaker--Eilers smoothing} ($\lambda = 1000$, order 2). Fits a
+      smooth curve through the counts.
+\item \textbf{Gaussian smoothing} ($\sigma = 30$ bp). Blurs at roughly the scale of
+      a nucleosome.
+\item \textbf{Subtract a running median} (window 375 bp). Removes slow drift in
+      overall depth, leaving the nucleosome oscillation centred on zero.
+\end{enumerate}
+
+Both coverage levels go through the identical chain. Parts of it are known to be
+redundant, and it is kept unchanged so that results stay comparable to earlier work.
+
+\subsection{Smoothing happens when the data is read, not on disk}
+
+The stored file holds \emph{raw} counts. Smoothing is applied by the dataloader
+each time a window is read.
+
+This costs training time --- it is the single largest cost per window --- and buys
+two things: smoothing is destructive and some of its parameters are still open
+questions, and one file can serve consumers that want the data differently.
+
+\subsection{Windows and the halo}
+
+The genome is cut into non-overlapping 25{,}000 bp windows, tiled from position~0.
+Incomplete windows at a chromosome's end are dropped, because the model takes a
+fixed input length.
+
+Smoothing a window in isolation would corrupt its edges, since the filters need
+neighbouring data that a bare window does not have. So each window is read with a
+\textbf{400 bp halo} on each side, smoothed, and then cropped back to 25{,}000.
+The halo comes from the stored array, never from padding: padding would reintroduce
+the very edge artefact the halo exists to remove.
+
+Gaussian smoothing reaches $4\sigma = 120$ bp and the running median reaches
+187~bp, both comfortably inside 400. Whittaker--Eilers has no finite reach, so its
+influence never becomes exactly zero --- but the residual it leaves is far below the
+precision at which the counts are stored, and is therefore invisible in practice.
+
+\subsection{Validity}
+
+A position is \emph{valid} if it is mappable and no smoothing kernel that produced
+it touched an unmappable base. In practice the mappability mask is grown by 120~bp
+before use, matching the Gaussian's reach. Positions within 400~bp of a chromosome
+end have no real halo and are excluded rather than repaired.
+
+Validity is recorded per position and per window. It is currently used for
+\emph{reporting}, not in the loss.
+
+\subsection{Splitting}
+
+Chromosomes are assigned whole to one split, so no window can appear on both sides:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+train & chr1--6, chr10--22 \\
+val   & chr7 \\
+test  & chr8, chr9 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{The model}
+
+A 1D U-Net: compress the signal three times, then expand it back, carrying detail
+across at each level.
+
+\subsection{Shape}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{stage} & \textbf{length} & \textbf{channels} \\
+\midrule
+input        & $L$   & 6 \\
+encoder 1    & $L/2$ & 64 \\
+encoder 2    & $L/4$ & 128 \\
+encoder 3    & $L/8$ & 256 \\
+bottleneck   & $L/8$ & 256 \\
+decoder 3--1 & back to $L$ & 256 $\to$ 128 $\to$ 64 \\
+output       & $L$   & 1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each stage halves the length and doubles the channels, so capacity stays roughly
+constant while the view widens. Skip connections pass each encoder output to the
+matching decoder, so fine detail is not lost in the compression. The output layer
+is a $1\times1$ convolution with no activation: the target is centred near zero and
+can be negative.
+
+\subsection{Inside a block}
+
+Every stage contains a residual block of four convolutions, kernel width 7, with
+dilations 1, 2, 4 and 8. Dilation lets a block see 6, 12, 24 and 48~bp without
+extra parameters --- local shape, transcription-factor footprint, and
+sub-nucleosomal scale.
+
+Two smaller choices matter. \textbf{Reflect padding} rather than zeros, because a
+coverage window has no natural boundary and zero padding would look like an abrupt
+loss of coverage. \textbf{GroupNorm} rather than BatchNorm, because the batch is
+small when each example is 25{,}000 long.
+
+The purely convolutional receptive field is 2{,}073~bp --- about ten nucleosomes.
+
+\subsection{Three variants}
+
+\begin{center}
+\begin{tabular}{llr}
+\toprule
+\textbf{variant} & \textbf{description} & \textbf{parameters} \\
+\midrule
+V1 & coverage and sequence in one shared first convolution & 8{,}517{,}953 \\
+V2 & coverage only; the sequence ablation                  & 8{,}515{,}393 \\
+V3 & separate stream per input, joined before the encoder  & 8{,}545{,}665 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+V3 is the variant in current use. Coverage passes through its own 1D convolution;
+sequence passes through a 2D convolution spanning all five bases at once and 11~bp
+along the genome --- one full turn of the DNA helix, the periodicity at which
+sequence influences nucleosome positioning. Each stream produces 32 channels, and
+the two are concatenated to 64 before the encoder.
+
+The point of the split is that one shared convolution has to serve a continuous
+count and a categorical one-hot code at the same time; two streams let each be
+read in its own terms.
+
+\section{Loss and training}
+
+The loss is \textbf{mean squared error} between the reconstruction and the deep
+track, and nothing else.
+
+Pearson correlation is computed on validation but carries no weight in the
+objective. It is reported because MSE and correlation can move apart: a model can
+lower MSE by shrinking its output toward zero without improving the shape at all.
+Watching both makes that visible.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+optimiser & AdamW, learning rate $10^{-3}$, weight decay $10^{-2}$ \\
+schedule  & halve the rate after 7 epochs without improvement, floor $10^{-5}$ \\
+clipping  & gradient norm 1.0 \\
+batch     & 16 windows \\
+epochs    & 40 \\
+seed      & 42 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The gradient norm is logged \emph{before} clipping. If it sits near 1.0 the clip is
+firing constantly and acting as a hidden reduction in learning rate rather than as
+a safety net.
+
+\textbf{The validity mask is available to the loss but switched off by default.}
+Using it is a change to the objective, and mixing that with a change to the data
+would leave neither attributable.
+
+\section{Evaluation}
+
+Evaluation runs on the held-out chromosomes, one window at a time.
+
+\subsection{The comparison that matters}
+
+Every metric is reported twice: once for the reconstruction, and once for the
+\textbf{raw undersampled input} against the same target.
+
+This is the point of the evaluation. A reconstruction correlating at 0.57 with the
+truth means nothing on its own --- what matters is what the input already achieved
+without any model. The gap between the two is the result.
+
+\subsection{Metrics}
+
+\textbf{Pearson correlation} measures agreement in shape and ignores amplitude.
+
+\textbf{Mean squared error} measures agreement including amplitude.
+
+\textbf{Peak distance} asks the biological question directly: are the nucleosomes
+in the right places? Peaks are called with a frozen peak caller, and each peak is
+matched to the nearest peak in the other track.
+
+That last measurement has a trap. Matching each \emph{true} peak to the nearest
+predicted one rewards predicting more peaks --- a track with a peak every few bases
+scores perfectly. So the distance is measured in both directions:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+forward & one distance per true peak; asks \emph{were the real peaks found?} \\
+reverse & one distance per predicted peak; asks \emph{are the predictions real?} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Peak counts for all three tracks are reported alongside. An improvement should only
+be quoted if it holds in both directions.
+
+\textbf{A Wilcoxon signed-rank test} compares the two sets of peak distances window
+by window. Paired, because each window supplies both arms.
+
+\section{Output}
+
+Training writes learning curves, the three best checkpoints by validation loss, and
+the exact configuration that produced them. Each checkpoint carries its own
+hyperparameters, so it can be reloaded without external notes.
+
+Evaluation writes:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\texttt{test\_summary.txt}        & the headline numbers \\
+\texttt{test\_signal\_metrics.csv} & per window: MSE, both correlations, valid fraction \\
+\texttt{test\_peak\_distances.csv} & per window: peak counts and both distances \\
+\texttt{predictions.tsv.gz}       & the reconstructed track, as bedGraph \\
+\texttt{ground\_truth.tsv.gz}     & the deep track, same format \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The per-window files are what allow the result to be examined rather than merely
+quoted --- for example, split by mappability.
+
+\section{Current results}
+
+Held-out chromosomes 8 and 9, sample BH01 (healthy), 5$\times$ input:
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+ & \textbf{reconstruction} & \textbf{raw input} \\
+\midrule
+Pearson $r$                 & 0.5729 & 0.4234 \\
+peak distance, forward      & 22 bp  & 34 bp  \\
+peak distance, reverse      & 23 bp  & 31 bp  \\
+peaks called (median)       & 126    & 115    \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The true track calls 122 peaks. Windows scored: 9{,}723. The reconstruction beats
+its input in 98.8\% of windows, and wins in \emph{both} peak directions, so the
+improvement is not an artefact of calling more peaks.
+
+Performance depends on how mappable the region is:
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{unmappable fraction} & \textbf{windows} & \textbf{recon $r$} & \textbf{input $r$} & \textbf{gain} \\
+\midrule
+$<$1\%      & 3{,}110 & 0.590 & 0.410 & $+0.179$ \\
+1--10\%     & 4{,}997 & 0.584 & 0.419 & $+0.166$ \\
+10--50\%    & 1{,}375 & 0.563 & 0.442 & $+0.126$ \\
+$>$50\%     &    241  & 0.262 & 0.651 & $-0.358$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The last row is worth reading carefully. Where more than half the window is
+unmappable, the \emph{input} appears to correlate better than anywhere else. That is
+not signal: both coverage levels contain the same read-pileup artefacts, so they
+agree with each other. The model does not reproduce those artefacts and scores
+poorly there --- which is evidence that what it learned is nucleosome structure
+rather than mapping error.
+
+\section{Known limitations}
+
+\begin{itemize}
+\item The validity mask is not used in the loss. It is available and switched off.
+\item Windows are kept if any position is valid, so a few almost entirely
+      unmappable windows reach the test set.
+\item An earlier, inherited data format used different window boundaries and a
+      different position convention. Results from the two cannot be compared window
+      by window; they agree at the level of summary metrics.
+\item Reconstructed amplitude is systematically smaller than the truth. This is the
+      expected behaviour of a squared-error objective under uncertainty, but it
+      means amplitudes are not comparable between samples of different depth.
+\end{itemize}
+
+\end{document}
